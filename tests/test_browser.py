@@ -3526,6 +3526,18 @@ window.close = function() {
     # same wasm side module works
     self.btest_exit(self.in_dir('main.c'), args=['-s', 'MAIN_MODULE=2', '-O2', '-s', 'EXPORT_ALL', 'side.wasm'])
 
+  def test_dlopen_async(self):
+    create_file('side.c', 'int foo = 42;\n')
+    self.run_process([EMCC, 'side.c', '-o', 'libside.so', '-s', 'SIDE_MODULE'])
+    self.btest_exit(test_file('other/test_dlopen_async.c'), args=['-s', 'MAIN_MODULE=2'])
+
+  def test_dlopen_blocking(self):
+    create_file('side.c', 'int foo = 42;\n')
+    self.run_process([EMCC, 'side.c', '-o', 'libside.so', '-s', 'SIDE_MODULE'])
+    self.btest_exit(test_file('other/test_dlopen_blocking.c'), args=['-s', 'MAIN_MODULE=2', '-s', 'ASYNCIFY'])
+    # Without the blocking version of dlopen should fail
+    self.btest_exit(test_file('other/test_dlopen_blocking.c'), assert_returncode=1, args=['-s', 'MAIN_MODULE=2'])
+
   # verify that dynamic linking works in all kinds of in-browser environments.
   # don't mix different kinds in a single test.
   @parameterized({

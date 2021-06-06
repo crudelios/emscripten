@@ -179,6 +179,9 @@ var LibraryDylink = {
   dlopen: function(filename, flag) {
     abort("To use dlopen, you need to use Emscripten's linking support, see https://github.com/emscripten-core/emscripten/wiki/Linking");
   },
+  emscripten_dlopen: function(filename, flags, user_data, onsuccess, onerror) {
+    abort("To use dlopen, you need to use Emscripten's linking support, see https://github.com/emscripten-core/emscripten/wiki/Linking");
+  },
   dlclose: function(handle) {
     abort("To use dlopen, you need to use Emscripten's linking support, see https://github.com/emscripten-core/emscripten/wiki/Linking");
   },
@@ -248,18 +251,6 @@ var LibraryDylink = {
     ___heap_base = end;
     GOT['__heap_base'].value = end;
     return ret;
-  },
-
-  // fetchBinary fetches binary data @ url. (async)
-  $fetchBinary: function(url) {
-    return fetch(url, { credentials: 'same-origin' }).then(function(response) {
-      if (!response['ok']) {
-        throw "failed to load binary file at '" + url + "'";
-      }
-      return response['arrayBuffer']();
-    }).then(function(buffer) {
-      return new Uint8Array(buffer);
-    });
   },
 
   // returns the side module metadata as an object
@@ -576,7 +567,7 @@ var LibraryDylink = {
   // If a library was already loaded, it is not loaded a second time. However
   // flags.global and flags.nodelete are handled every time a load request is made.
   // Once a library becomes "global" or "nodelete", it cannot be removed or unloaded.
-  $loadDynamicLibrary__deps: ['$LDSO', '$loadWebAssemblyModule', '$asmjsMangle', '$fetchBinary', '$isInternalSym', '$mergeLibSymbols'],
+  $loadDynamicLibrary__deps: ['$LDSO', '$loadWebAssemblyModule', '$asmjsMangle', '$isInternalSym', '$mergeLibSymbols'],
   $loadDynamicLibrary: function(lib, flags) {
     if (lib == '__main__' && !LDSO.loadedLibNames[lib]) {
       LDSO.loadedLibs[-1] = {
@@ -628,7 +619,7 @@ var LibraryDylink = {
     // libData <- libFile
     function loadLibData(libFile) {
       // for wasm, we can use fetch for async, but for fs mode we can only imitate it
-      if (flags.fs) {
+      if (flags.fs && flags.fs.findObject(libFile)) {
         var libData = flags.fs.readFile(libFile, {encoding: 'binary'});
         if (!(libData instanceof Uint8Array)) {
           libData = new Uint8Array(libData);
@@ -637,9 +628,13 @@ var LibraryDylink = {
       }
 
       if (flags.loadAsync) {
-        return fetchBinary(libFile);
+        return new Promise(function(resolve, reject) {
+          readAsync(libFile, function(data) { resolve(new Uint8Array(data)); }, reject);
+        });
       }
+
       // load the binary synchronously
+      if (!readBinary) 'file not found';
       return readBinary(libFile);
     }
 
@@ -674,7 +669,7 @@ var LibraryDylink = {
       return getLibModule().then(function(libModule) {
         moduleLoaded(libModule);
         return handle;
-      })
+      });
     }
 
     moduleLoaded(getLibModule());
@@ -718,10 +713,8 @@ var LibraryDylink = {
   },
 
   // void* dlopen(const char* filename, int flags);
-  dlopen__deps: ['$DLFCN', '$FS', '$ENV'],
-  dlopen__proxy: 'sync',
-  dlopen__sig: 'iii',
-  dlopen: function(filenameAddr, flags) {
+  $dlopen_internal__deps: ['$DLFCN', '$FS', '$ENV'],
+  $dlopen_internal: function(filenameAddr, flags, jsflags) {
     // void *dlopen(const char *file, int mode);
     // http://pubs.opengroup.org/onlinepubs/009695399/functions/dlopen.html
     var searchpaths = [];
@@ -757,11 +750,13 @@ var LibraryDylink = {
     }
 
     // We don't care about RTLD_NOW and RTLD_LAZY.
-    var jsflags = {
+    Object.assign(jsflags, {
       global:   Boolean(flags & {{{ cDefine('RTLD_GLOBAL') }}}),
       nodelete: Boolean(flags & {{{ cDefine('RTLD_NODELETE') }}}),
+    });
 
-      fs: FS, // load libraries from provided filesystem
+    if (jsflags.loadAsync) {
+      return loadDynamicLibrary(filename, jsflags);
     }
 
     try {
@@ -772,6 +767,57 @@ var LibraryDylink = {
 #endif
       DLFCN.errorMsg = 'Could not load dynamic lib: ' + filename + '\n' + e;
       return 0;
+    }
+  },
+
+  dlopen__deps: ['$dlopen_internal'],
+  dlopen__proxy: 'sync',
+  dlopen__sig: 'iii',
+  dlopen: function(filename, flags) {
+#if ASYNCIFY
+    return Asyncify.handleSleep(function(wakeUp) {
+      var jsflags = {
+        loadAsync: true,
+        fs: FS, // load libraries from provided filesystem
+      }
+      var promise = dlopen_internal(filename, flags, jsflags);
+      promise.then(wakeUp).catch(function() { wakeUp(0) });
+    });
+#else
+    var jsflags = {
+      loadAsync: false,
+      fs: FS, // load libraries from provided filesystem
+    }
+    return dlopen_internal(filename, flags, jsflags);
+#endif
+  },
+
+  // Async version of dlopen.
+  emscripten_dlopen__deps: ['$DLFCN', '$dlopen_internal', '$callUserCallback',
+#if !MINIMAL_RUNTIME
+    '$runtimeKeepalivePush',
+    '$runtimeKeepalivePop',
+#endif
+  ],
+  emscripten_dlopen__proxy: 'sync',
+  emscripten_dlopen__sig: 'iii',
+  emscripten_dlopen: function(filename, flags, user_data, onsuccess, onerror) {
+    function errorCallback(e) {
+      DLFCN.errorMsg = 'Could not load dynamic lib: ' + UTF8ToString(filename) + '\n' + e;
+      {{{ runtimeKeepalivePop() }}}
+      callUserCallback(function () { {{{ makeDynCall('vi', 'onerror') }}}(user_data); });
+    }
+    function successCallback(handle) {
+      {{{ runtimeKeepalivePop() }}}
+      callUserCallback(function () { {{{ makeDynCall('vii', 'onsuccess') }}}(user_data, handle); });
+    }
+
+    {{{ runtimeKeepalivePush() }}}
+    var promise = dlopen_internal(filename, flags, { loadAsync: true });
+    if (promise) {
+      promise.then(successCallback, errorCallback);
+    } else {
+      errorCallback();
     }
   },
 
